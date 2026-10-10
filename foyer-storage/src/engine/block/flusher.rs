@@ -83,6 +83,10 @@ where
     Wait {
         tx: oneshot::Sender<()>,
     },
+    /// Flush the pending entries, then stop the runner and release its resources.
+    Close {
+        tx: oneshot::Sender<()>,
+    },
 }
 
 impl<K, V, P> Debug for Submission<K, V, P>
@@ -112,6 +116,7 @@ where
                 f.debug_struct("Reinsertion").field("reinsertion", reinsertion).finish()
             }
             Self::Wait { .. } => f.debug_struct("Wait").finish(),
+            Self::Close { .. } => f.debug_struct("Close").finish(),
         }
     }
 }
@@ -208,6 +213,7 @@ where
             ctx,
             tombstone_infos: vec![],
             waiters: vec![],
+            close_waiters: vec![],
             piece_refs: vec![],
             rotate_buffer,
             queue_init: None,
@@ -250,6 +256,15 @@ where
     pub fn wait(&self) -> impl Future<Output = ()> + Send + 'static {
         let (tx, rx) = oneshot::channel();
         self.submit(Submission::Wait { tx });
+        async move {
+            let _ = rx.await;
+        }
+    }
+
+    /// Stop the runner after the pending entries are flushed. Later submissions are rejected.
+    pub fn close(&self) -> impl Future<Output = ()> + Send + 'static {
+        let (tx, rx) = oneshot::channel();
+        self.submit(Submission::Close { tx });
         async move {
             let _ = rx.await;
         }
@@ -298,6 +313,7 @@ where
     tombstone_infos: Vec<TombstoneInfo>,
     piece_refs: Vec<PieceRef<K, V, P>>,
     waiters: Vec<oneshot::Sender<()>>,
+    close_waiters: Vec<oneshot::Sender<()>>,
     queue_init: Option<Instant>,
 
     /// IoBuffer rotates between writer and inflight io task.
@@ -386,6 +402,11 @@ where
                 self.buffer = Some(buffer);
             }
 
+            // Close requests are honored once everything received before them is on disk.
+            if !self.close_waiters.is_empty() && !need_flush && no_io_task {
+                break;
+            }
+
             tokio::select! {
                 biased;
                 IoTaskCtx { handle, waiters, init, io_slice, tombstone_infos, piece_refs } = self.next_io_task_finish() => {
@@ -402,6 +423,14 @@ where
                 // Graceful shutdown.
                 else => break,
             }
+        }
+
+        // Release the block manager and the device before reporting back.
+        drop(rx);
+        let close_waiters = std::mem::take(&mut self.close_waiters);
+        drop(self);
+        for tx in close_waiters {
+            let _ = tx.send(());
         }
         Ok(())
     }
@@ -455,6 +484,7 @@ where
                 }
             }
             Submission::Wait { tx } => self.waiters.push(tx),
+            Submission::Close { tx } => self.close_waiters.push(tx),
         }
     }
 

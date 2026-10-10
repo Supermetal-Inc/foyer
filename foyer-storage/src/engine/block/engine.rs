@@ -563,6 +563,9 @@ where
         async move {
             this.inner.active.store(false, Ordering::Relaxed);
             this.wait().await;
+            // The runners own the block manager, which owns the reclaimer, which owns the
+            // flusher senders. Stop them explicitly so the device is released on drop.
+            join_all(this.inner.flushers.iter().map(|flusher| flusher.close())).await;
             Ok(())
         }
         .boxed()
@@ -1402,5 +1405,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(engine.inner.block_manager.blocks(), (1 + 2 + 4) * MB / (64 * KB));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_close_releases_device() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let memory = cache_for_test();
+        let store = engine_for_test(dir.path()).await;
+
+        enqueue(&store, memory.insert(1, vec![1; 7 * KB]));
+        store.wait().await;
+
+        let device = store.inner.device.clone();
+        store.close().await.unwrap();
+        drop(store);
+
+        assert_eq!(Arc::strong_count(&device), 1);
     }
 }
